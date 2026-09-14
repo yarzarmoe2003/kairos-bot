@@ -63,7 +63,7 @@ function equity(){return (ST.usdtEq||0)+(ST.eth||0)*(ST.price||0);}
 function snapshotEq(){const eq=equity();if(ST.base==null)ST.base=eq;
  if(eq>(ST.peak||0))ST.peak=eq;const dd=(ST.peak-eq)/ST.peak;if(dd>ST.maxDD)ST.maxDD=dd;}
 
-function armOCO(x){return api('POST','/api/v5/trade/order-algo',{instId:INST,ordType:'oco',
+function armOCO(x){return api('POST','/api/v5/trade/order-algo',{instId:INST,ordType:'oco',tdMode:'cash',
   side:'sell',sz:q4(x.qty),tpTriggerPx:rp(x.tp),tpOrdPx:rp(x.tp),
   slTriggerPx:rp(x.sl),slOrdPx:'-1'})
  .then(j=>{x.algoId=j.data&&j.data[0]&&j.data[0].algoId;
