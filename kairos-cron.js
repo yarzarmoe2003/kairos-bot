@@ -202,13 +202,20 @@ async function reconcile(){
  if(!HASKEYS)return;
  try{
   const b=await api('GET','/api/v5/account/balance');
-  let usdt=0,avail=0,eth=0;
+  let usdt=0,avail=0,ethEq=0,ethBal=0;
   (b.data||[]).forEach(d=>(d.details||[]).forEach(v=>{
    if(v.ccy==='USDT'){usdt=parseFloat(v.eq)||0;avail=parseFloat(v.availBal||v.availEq)||0;}
-   if(v.ccy==='ETH')eth=parseFloat(v.eq)||0;}));
-  ST.usdtEq=usdt;ST.availUsd=avail;ST.eth=eth;
-     if(!ST.pos&&!ST.skipAdopt&&eth>=SPEC.minSz){await adopt(eth);}
-  else if(ST.pos&&!ST.pos.closing&&eth<ST.pos.qty*0.5){
+   if(v.ccy==='ETH'){ethEq=parseFloat(v.eq)||0;ethBal=parseFloat(v.bal)||0;}}));
+  ST.usdtEq=usdt;ST.availUsd=avail;ST.eth=ethBal;ST.ethEq=ethEq;
+  if(ST.pos&&ethBal<0){
+   log('SKIP','reality diverged — ETH balance '+ethBal.toFixed(4)+' · external account change · dropping ghost position');
+   await cancelAlgos();ST.pos=null;save();return;
+  }
+  if(ST.pos&&ST.pos.closing&&ethBal>=ST.pos.qty*0.5){
+   ST.pos.closing=false;log('SYS','stuck closing flag cleared — position still held');save();
+  }
+  if(!ST.pos&&!ST.skipAdopt&&ethBal>=SPEC.minSz){await adopt(ethBal);}
+  else if(ST.pos&&!ST.pos.closing&&ethBal<ST.pos.qty*0.5){
    const pr=ST.price||ST.pos.entry;
    const hitTp=pr>=ST.pos.tp,hitSl=pr<=ST.pos.sl;
    let exit=hitTp?ST.pos.tp:hitSl?ST.pos.sl:pr;
@@ -217,7 +224,7 @@ async function reconcile(){
     if(sells.length)exit=parseFloat(sells[0].fillPx)||exit;}catch(e){}
    await cancelAlgos();ST.pos.closing=true;
    finalizeTrade(exit,hitTp?'TARGET':hitSl?'STOP':'SIGNAL');
-   log('OCO fired between runs — trade recorded from fills');
+   log('SYS','OCO fired between runs — trade recorded from fills');
   }
   else if(ST.pos&&!ST.pos.closing&&!ST.pos.algoId){await armOCO(ST.pos);}
  }catch(e){log('reconcile: '+e.message);}
