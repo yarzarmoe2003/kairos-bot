@@ -206,7 +206,7 @@ async function reconcile(){
    if(v.ccy==='USDT'){usdt=parseFloat(v.eq)||0;avail=parseFloat(v.availBal||v.availEq)||0;}
    if(v.ccy==='ETH')eth=parseFloat(v.eq)||0;}));
   ST.usdtEq=usdt;ST.availUsd=avail;ST.eth=eth;
-  if(!ST.pos&&eth>=SPEC.minSz){await adopt(eth);}
+     if(!ST.pos&&!ST.skipAdopt&&eth>=SPEC.minSz){await adopt(eth);}
   else if(ST.pos&&!ST.pos.closing&&eth<ST.pos.qty*0.5){
    const pr=ST.price||ST.pos.entry;
    const hitTp=pr>=ST.pos.tp,hitSl=pr<=ST.pos.sl;
