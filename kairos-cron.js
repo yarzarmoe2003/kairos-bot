@@ -22,6 +22,7 @@ try{const d=JSON.parse(fs.readFileSync(STATE,'utf8'));
  if(d&&d.settings){ST=Object.assign(ST,d);ST.pos=d.pos||null;}}catch(e){}
 function save(){try{fs.writeFileSync(STATE,JSON.stringify({
  settings:ST.settings,pos:ST.pos,cool:ST.cool,trades:ST.trades.slice(0,120),
+       skipAdopt:ST.skipAdopt,
  markers:ST.markers.slice(-60),candles:ST.candles.slice(-MAXC),lastClosedT:ST.lastClosedT,
  avgVol:ST.avgVol,seen:ST.seen,fees:ST.fees,base:ST.base,peak:ST.peak,maxDD:ST.maxDD}));}catch(e){}}
 const wait=ms=>new Promise(r=>setTimeout(r,ms));
