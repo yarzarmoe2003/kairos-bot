@@ -1,15 +1,22 @@
 /* ============================================================
-   KAIROS CRON v1.0 — single-cycle engine for GitHub Actions
-   ETH-USDT · OKX DEMO ONLY · 15-minute candles · long-only
-   One run = one decision cycle. State persists via git commit.
-   Keys come from GitHub Secrets: OKX_KEY / OKX_SECRET / OKX_PASS
-   No keys? SHADOW MODE — logs decisions, places nothing.
-   Hard-wired to demo: x-simulated-trading: 1 on every request.
+   KAIROS CRON v1.3-vcap — defined-capital edition
+   ETH-USDT · OKX DEMO ONLY · 15m candles · long-only
+   ------------------------------------------------------------
+   VIRTUAL CAPITAL MODEL:
+   · The bot manages a virtual $10,000 book (VCAP0)
+   · All sizing, P&L and equity come from this ledger —
+     the OKX balance is collateral, not the ledger
+   · If equity falls below $100 (flat), the account is
+     declared blown and a fresh $10,000 attempt starts
+     automatically. Attempt counter is kept.
+   Keys from GitHub Secrets: OKX_KEY / OKX_SECRET / OKX_PASS
+   No keys? SHADOW MODE. x-simulated-trading: 1 hard-wired.
    ============================================================ */
 'use strict';
 const https=require('https'),crypto=require('crypto'),fs=require('fs');
 const INST='ETH-USDT',BAR='15m';
 const FEE=0.001,RISK=1.5,WARM=60,MAXC=400;
+const VCAP0=10000,VCAP_FLOOR=100;
 const SPEC={lotSz:0.0001,minSz:0.0001,tickSz:0.01,minMkt:1};
 const STATE=__dirname+'/kairos-state.json';
 const KEYS={key:process.env.OKX_KEY||'',secret:process.env.OKX_SECRET||'',pass:process.env.OKX_PASS||''};
@@ -17,14 +24,16 @@ const HASKEYS=!!(KEYS.key&&KEYS.secret&&KEYS.pass);
 
 let ST={settings:{sl:1.6,tp:2.4,trend:true,cool:3,running:true},
  pos:null,cool:0,trades:[],markers:[],candles:[],lastClosedT:0,avgVol:0,seen:0,
- fees:0,base:null,peak:null,maxDD:0,usdtEq:null,availUsd:null,eth:0,price:null};
+ fees:0,base:null,peak:null,maxDD:0,usdtEq:null,availUsd:null,eth:0,price:null,
+ skipAdopt:false,attempts:1};
 try{const d=JSON.parse(fs.readFileSync(STATE,'utf8'));
  if(d&&d.settings){ST=Object.assign(ST,d);ST.pos=d.pos||null;}}catch(e){}
+if(ST.base==null)ST.base=VCAP0;
 function save(){try{fs.writeFileSync(STATE,JSON.stringify({
  settings:ST.settings,pos:ST.pos,cool:ST.cool,trades:ST.trades.slice(0,120),
-       skipAdopt:ST.skipAdopt,
  markers:ST.markers.slice(-60),candles:ST.candles.slice(-MAXC),lastClosedT:ST.lastClosedT,
- avgVol:ST.avgVol,seen:ST.seen,fees:ST.fees,base:ST.base,peak:ST.peak,maxDD:ST.maxDD}));}catch(e){}}
+ avgVol:ST.avgVol,seen:ST.seen,fees:ST.fees,base:ST.base,peak:ST.peak,maxDD:ST.maxDD,
+ skipAdopt:ST.skipAdopt,attempts:ST.attempts}));}catch(e){}}
 const wait=ms=>new Promise(r=>setTimeout(r,ms));
 const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
 const rp=v=>(Math.round(v/SPEC.tickSz)*SPEC.tickSz).toFixed(2);
@@ -60,7 +69,15 @@ function atr(cs,n){const o=cs.map(()=>NaN);let a=null;
 function recompute(){if(ST.candles.length<2)return;
  const c=ST.candles.map(x=>x.c);
  ST.ind={f:ema(c,12),s:ema(c,26),t:ema(c,200),r:rsi(c,14),a:atr(ST.candles,14)};}
-function equity(){return (ST.usdtEq||0)+(ST.eth||0)*(ST.price||0);}
+
+/* ---- virtual capital ledger ---- */
+function virtualEquity(){
+ let v=ST.base??VCAP0;
+ for(const t of ST.trades)v+=(t.pnl||0);
+ if(ST.pos&&ST.price)v+=(ST.price-ST.pos.entry)*ST.pos.qty;
+ return v;
+}
+function equity(){return virtualEquity();}
 function snapshotEq(){const eq=equity();if(ST.base==null)ST.base=eq;
  if(eq>(ST.peak||0))ST.peak=eq;const dd=(ST.peak-eq)/ST.peak;if(dd>ST.maxDD)ST.maxDD=dd;}
 
@@ -83,10 +100,11 @@ function amendStop(x){
 async function buy(c,a){
  if(!HASKEYS){log('SHADOW MODE — bull cross valid, no keys: order not placed');return;}
  if(ST.pos)return;
- const eq=equity();if(eq<=0){log('equity unknown — skipping');return;}
+ const eq=equity();if(eq<=0){log('virtual equity depleted — skipping');return;}
  const slD=ST.settings.sl*a,tpD=ST.settings.tp*a,entry0=c.c;
  let qty=(eq*RISK/100)/slD,capped=false;
- const capN=Math.max(0,ST.availUsd||0)*0.98;
+ /* spot discipline: notional capped at 98% of BOTH the virtual book and real available cash */
+ const capN=Math.min(eq*0.98,Math.max(0,ST.availUsd||0)*0.98);
  if(qty*entry0>capN){qty=capN/entry0;capped=true;}
  qty=Math.floor(qty/SPEC.lotSz)*SPEC.lotSz;qty=+q4(qty);
  if(qty<SPEC.minSz||qty*entry0<SPEC.minMkt){log('below spot minimums — skipped');return;}
@@ -97,7 +115,8 @@ async function buy(c,a){
   ST.pos={side:1,entry:entry0,qty:qty,sl:entry0-slD,tp:entry0+tpD,atr:a,riskUSD:qty*slD,
    be:false,tOpen:Date.now(),ext:entry0,lastTrail:entry0,ordId:ordId,manual:false};
   ST.markers.push({t:c.t,p:entry0,type:'E'});save();
-  log('BUY '+qty.toFixed(4)+' ETH @ ~'+entry0.toFixed(1)+' · SL '+ST.pos.sl.toFixed(1)+' · TP '+ST.pos.tp.toFixed(1)+(capped?' · cash-capped':''));
+  log('BUY '+qty.toFixed(4)+' ETH @ ~'+entry0.toFixed(1)+' · SL '+ST.pos.sl.toFixed(1)+' · TP '+ST.pos.tp.toFixed(1)
+   +' · risk $'+(qty*slD).toFixed(2)+(capped?' · capped at virtual book':''));
   await wait(1200);
   let ap=entry0,fsz=qty;
   try{const o=await api('GET','/api/v5/trade/order?ordId='+ordId+'&instId='+INST);
@@ -131,12 +150,13 @@ function finalizeTrade(exit,reason){
  const x=ST.pos;if(!x)return;ST.pos=null;
  const fee=x.qty*exit*FEE,pnl=(exit-x.entry)*x.qty-fee;
  ST.fees+=fee;
- ST.trades.unshift({ts:Date.now(),src:'strategy',entry:x.entry,exit:exit,qty:x.qty,
+ ST.trades.unshift({ts:Date.now(),src:x.manual?'manual':'strategy',entry:x.entry,exit:exit,qty:x.qty,
   pnl:pnl,r:x.riskUSD?pnl/x.riskUSD:0,reason:reason,dur:Date.now()-x.tOpen});
  if(ST.trades.length>120)ST.trades.length=120;
  ST.markers.push({t:ST.candles.length?ST.candles[ST.candles.length-1].t:Date.now(),p:exit,type:'X',win:pnl>=0});
  if(pnl<0)ST.cool=ST.settings.cool;
- log((pnl>=0?'WIN ':'LOSS ')+reason+' @ '+exit.toFixed(1)+' · '+(pnl>=0?'+':'')+'$'+pnl.toFixed(2));
+ log((pnl>=0?'WIN ':'LOSS ')+reason+' @ '+exit.toFixed(1)+' · '+(pnl>=0?'+':'')+'$'+pnl.toFixed(2)
+  +' · virtual equity $'+equity().toFixed(2));
  snapshotEq();save();
 }
 function manage(){
@@ -175,7 +195,7 @@ function onClosed(){
  if(ST.pos){
   const crossDn=f<s&&ST.ind.f[i-1]>=ST.ind.s[i-1];
   if(crossDn){log('bear cross — selling back to USDT');sell(c.c,'SIGNAL');}
-  else log('HOLD · uPnL '+(((ST.price||c.c)-ST.pos.entry)*ST.pos.qty).toFixed(2));
+  else log('HOLD · uPnL '+(((ST.price||c.c)-ST.pos.entry)*ST.pos.qty).toFixed(2)+' · virtual equity $'+equity().toFixed(2));
   save();return;
  }
  if(!ST.settings.running){save();return;}
@@ -198,6 +218,13 @@ function onClosed(){
  ST.avgVol=v20.reduce((s2,x)=>s2+x.v,0)/Math.max(1,v20.length);
  save();
 }
+async function pollPrice(){
+ try{
+  const j=await pub('/api/v5/market/ticker?instId='+INST);
+  const p=parseFloat(j.data&&j.data[0]&&j.data[0].last);
+  if(p){ST.price=p;if(ST.pos)manage();}
+ }catch(e){}
+}
 async function reconcile(){
  if(!HASKEYS)return;
  try{
@@ -206,13 +233,13 @@ async function reconcile(){
   (b.data||[]).forEach(d=>(d.details||[]).forEach(v=>{
    if(v.ccy==='USDT'){usdt=parseFloat(v.eq)||0;avail=parseFloat(v.availBal||v.availEq)||0;}
    if(v.ccy==='ETH'){ethEq=parseFloat(v.eq)||0;ethBal=parseFloat(v.bal)||0;}}));
-  ST.usdtEq=usdt;ST.availUsd=avail;ST.eth=ethBal;ST.ethEq=ethEq;
+  ST.usdtEq=usdt;ST.availUsd=avail;ST.eth=ethBal;
   if(ST.pos&&ethBal<0){
    log('SKIP','reality diverged — ETH balance '+ethBal.toFixed(4)+' · external account change · dropping ghost position');
    await cancelAlgos();ST.pos=null;save();return;
   }
   if(ST.pos&&ST.pos.closing&&ethBal>=ST.pos.qty*0.5){
-   ST.pos.closing=false;log('SYS','stuck closing flag cleared — position still held');save();
+   ST.pos.closing=false;log('stuck closing flag cleared — position still held');save();
   }
   if(!ST.pos&&!ST.skipAdopt&&ethBal>=SPEC.minSz){await adopt(ethBal);}
   else if(ST.pos&&!ST.pos.closing&&ethBal<ST.pos.qty*0.5){
@@ -224,9 +251,21 @@ async function reconcile(){
     if(sells.length)exit=parseFloat(sells[0].fillPx)||exit;}catch(e){}
    await cancelAlgos();ST.pos.closing=true;
    finalizeTrade(exit,hitTp?'TARGET':hitSl?'STOP':'SIGNAL');
-   log('SYS','OCO fired between runs — trade recorded from fills');
+   log('OCO fired between runs — trade recorded from fills');
   }
   else if(ST.pos&&!ST.pos.closing&&!ST.pos.algoId){await armOCO(ST.pos);}
+  /* ---- blow-up guard: flat + virtual equity below floor → fresh $10,000 ---- */
+  if(!ST.pos){
+   const eq=virtualEquity();
+   if(eq<VCAP_FLOOR){
+    ST.attempts=(ST.attempts||1)+1;
+    log('*** VIRTUAL ACCOUNT BLOWN — equity $'+eq.toFixed(2)+' < $'+VCAP_FLOOR
+     +' · starting fresh $'+VCAP0+' · ATTEMPT #'+ST.attempts+' ***');
+    /* keep trade history visible; shift base so the ledger restarts at exactly $10,000 */
+    ST.base=VCAP0-ST.trades.reduce((s,t)=>s+(t.pnl||0),0);
+    ST.peak=VCAP0;ST.cool=0;save();
+   }
+  }
  }catch(e){log('reconcile: '+e.message);}
 }
 async function adopt(eth){
@@ -256,6 +295,8 @@ async function loadSpec(){
   if(p){ST.price=p;if(ST.pos)manage();}}catch(e){}
  try{await reconcile();}catch(e){}
  snapshotEq();save();
- log('SUMMARY · eq $'+equity().toFixed(2)+' · pos '+(ST.pos?('LONG '+ST.pos.qty+' @ '+ST.pos.entry):'CASH')+' · cool '+ST.cool+' · fills '+ST.trades.length+' · '+(HASKEYS?'LIVE DEMO':'SHADOW MODE'));
+ log('SUMMARY · vcap $'+equity().toFixed(2)+' · pos '+(ST.pos?('LONG '+ST.pos.qty+' @ '+ST.pos.entry):'CASH')
+  +' · cool '+ST.cool+' · fills '+ST.trades.length+' · attempt #'+(ST.attempts||1)
+  +' · '+(HASKEYS?'LIVE DEMO':'SHADOW MODE'));
  process.exit(0);
 })().catch(e=>{console.error('cycle failed:',e.message);save();process.exit(0);});
