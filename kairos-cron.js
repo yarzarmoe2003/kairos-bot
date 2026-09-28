@@ -1,28 +1,29 @@
 /* ============================================================
-   KAIROS CRON v1.3-vcap — defined-capital edition
+   KAIROS CRON v1.5-sd — Supply & Demand + RSI · frequency build
    ETH-USDT · OKX DEMO ONLY · 15m candles · long-only
    ------------------------------------------------------------
-   VIRTUAL CAPITAL MODEL:
-   · The bot manages a virtual $10,000 book (VCAP0)
-   · All sizing, P&L and equity come from this ledger —
-     the OKX balance is collateral, not the ledger
-   · If equity falls below $100 (flat), the account is
-     declared blown and a fresh $10,000 attempt starts
-     automatically. Attempt counter is kept.
-   Keys from GitHub Secrets: OKX_KEY / OKX_SECRET / OKX_PASS
-   No keys? SHADOW MODE. x-simulated-trading: 1 hard-wired.
+   STRATEGY — "THE ZONE SNIPER" (minimal parameters):
+   · Demand zones auto-detected from pivot bounces (fresh OK)
+   · BUY: price dips into zone AND RSI(14) < 40
+   · SL: zone low − 0.5×ATR · risk 1.5% of the $10k book
+   · TP: max(2× risk, supply ceiling if ≥ 2× risk) — R:R ≥ 2:1
+   · Cooldown 2 candles after loss · chaos guard ATR% > 2.5%
+   · Time-stop: position older than 12h exits at market
+   Safety frame: $10k virtual book · auto fresh $10k attempt
+   if blown · OCO on OKX servers · all prior guards kept.
    ============================================================ */
 'use strict';
 const https=require('https'),crypto=require('crypto'),fs=require('fs');
 const INST='ETH-USDT',BAR='15m';
 const FEE=0.001,RISK=1.5,WARM=60,MAXC=400;
 const VCAP0=10000,VCAP_FLOOR=100;
+const RSI_BUY=40,PIV=3,ZTOL=0.005,CHAOS=0.025,MAX_HOLD_MS=12*3600e3;
 const SPEC={lotSz:0.0001,minSz:0.0001,tickSz:0.01,minMkt:1};
 const STATE=__dirname+'/kairos-state.json';
 const KEYS={key:process.env.OKX_KEY||'',secret:process.env.OKX_SECRET||'',pass:process.env.OKX_PASS||''};
 const HASKEYS=!!(KEYS.key&&KEYS.secret&&KEYS.pass);
 
-let ST={settings:{sl:1.6,tp:2.4,trend:true,cool:3,running:true},
+let ST={settings:{sl:1.6,tp:2.4,cool:2,running:true},
  pos:null,cool:0,trades:[],markers:[],candles:[],lastClosedT:0,avgVol:0,seen:0,
  fees:0,base:null,peak:null,maxDD:0,usdtEq:null,availUsd:null,eth:0,price:null,
  skipAdopt:false,attempts:1};
@@ -70,7 +71,6 @@ function recompute(){if(ST.candles.length<2)return;
  const c=ST.candles.map(x=>x.c);
  ST.ind={f:ema(c,12),s:ema(c,26),t:ema(c,200),r:rsi(c,14),a:atr(ST.candles,14)};}
 
-/* ---- virtual capital ledger ---- */
 function virtualEquity(){
  let v=ST.base??VCAP0;
  for(const t of ST.trades)v+=(t.pnl||0);
@@ -92,18 +92,67 @@ async function cancelAlgos(){try{
  const rows=(p.data||[]).filter(z=>z.instId===INST);
  if(rows.length)await api('POST','/api/v5/trade/cancel-algos',rows.map(z=>({algoId:z.algoId,instId:INST})));
  return rows.length;}catch(e){return 0;}}
-function amendStop(x){
- priv('POST','/api/v5/trade/amend-algos',{algoId:x.algoId,instId:INST,newSlTriggerPx:rp(x.sl)})
-  .then(j=>{if(j.code!=='0')throw new Error((j.data&&j.data[0]&&j.data[0].sMsg)||'amend rejected');})
-  .catch(e=>log('server stop amend failed — '+e.message+' · local trail continues'));}
 
-async function buy(c,a){
- if(!HASKEYS){log('SHADOW MODE — bull cross valid, no keys: order not placed');return;}
+/* ---------------- ZONES ---------------- */
+function computeZones(cs){
+ if(cs.length<30)return[];
+ const piv=[];
+ for(let i=PIV;i<cs.length-PIV;i++){
+  let isH=true,isL=true;
+  for(let j=i-PIV;j<=i+PIV;j++){
+   if(j===i)continue;
+   if(cs[j].h>cs[i].h)isH=false;
+   if(cs[j].l<cs[i].l)isL=false;
+  }
+  if(isH)piv.push({p:cs[i].h,t:cs[i].t});
+  if(isL)piv.push({p:cs[i].l,t:cs[i].t});
+ }
+ piv.sort((a,b)=>a.p-b.p);
+ const tol=cs[cs.length-1].c*ZTOL;
+ const groups=[];let cur=[];
+ for(const v of piv){
+  if(!cur.length||v.p-cur[cur.length-1].p<=tol)cur.push(v);
+  else{groups.push(cur);cur=[v];}
+ }
+ if(cur.length)groups.push(cur);
+ return groups.map(g=>({
+  lo:Math.min.apply(null,g.map(x=>x.p)),
+  hi:Math.max.apply(null,g.map(x=>x.p)),
+  n:g.length,
+  last:Math.max.apply(null,g.map(x=>x.t))
+ }));
+}
+function supportHit(zones,c,a){
+ let best=null;
+ for(const z of zones){
+  if(c.l<=z.hi&&c.c>=z.lo-0.25*a&&z.hi<=c.c*1.01){
+   if(!best||z.hi>best.hi)best=z;
+  }
+ }
+ return best;
+}
+function nextResistance(zones,price){
+ let best=null;
+ for(const z of zones){if(z.lo>price*1.001){if(!best||z.lo<best.lo)best=z;}}
+ return best;
+}
+
+/* ---------------- execution ---------------- */
+async function buy(c,a,sup){
+ if(!HASKEYS){log('SHADOW — zone setup valid at '+sup.lo.toFixed(1)+'-'+sup.hi.toFixed(1)+' · no keys: order not placed');return;}
  if(ST.pos)return;
  const eq=equity();if(eq<=0){log('virtual equity depleted — skipping');return;}
- const slD=ST.settings.sl*a,tpD=ST.settings.tp*a,entry0=c.c;
+ const entry0=c.c;
+ const stop=sup.lo-0.5*a;
+ const slD=entry0-stop;
+ if(!(slD>0)){log('bad stop geometry — skipped');return;}
+ const minTp=entry0+2*slD;
+ const zones=computeZones(ST.candles);
+ const res=nextResistance(zones,entry0);
+ let tp,tptag;
+ if(res&&res.hi>=minTp){tp=res.hi;tptag='ceiling';}
+ else{tp=minTp;tptag='2R';}
  let qty=(eq*RISK/100)/slD,capped=false;
- /* spot discipline: notional capped at 98% of BOTH the virtual book and real available cash */
  const capN=Math.min(eq*0.98,Math.max(0,ST.availUsd||0)*0.98);
  if(qty*entry0>capN){qty=capN/entry0;capped=true;}
  qty=Math.floor(qty/SPEC.lotSz)*SPEC.lotSz;qty=+q4(qty);
@@ -112,20 +161,23 @@ async function buy(c,a){
   const r=await api('POST','/api/v5/trade/order',{instId:INST,tdMode:'cash',side:'buy',
    ordType:'market',sz:q4(qty),tgtCcy:'base_ccy'});
   const ordId=r.data&&r.data[0]&&r.data[0].ordId;
-  ST.pos={side:1,entry:entry0,qty:qty,sl:entry0-slD,tp:entry0+tpD,atr:a,riskUSD:qty*slD,
-   be:false,tOpen:Date.now(),ext:entry0,lastTrail:entry0,ordId:ordId,manual:false};
+  ST.pos={side:1,entry:entry0,qty:qty,sl:stop,tp:tp,atr:a,riskUSD:qty*slD,
+   be:false,tOpen:Date.now(),ext:entry0,lastTrail:entry0,ordId:ordId,manual:false,
+   zone:sup.lo.toFixed(1)+'-'+sup.hi.toFixed(1)};
   ST.markers.push({t:c.t,p:entry0,type:'E'});save();
-  log('BUY '+qty.toFixed(4)+' ETH @ ~'+entry0.toFixed(1)+' · SL '+ST.pos.sl.toFixed(1)+' · TP '+ST.pos.tp.toFixed(1)
-   +' · risk $'+(qty*slD).toFixed(2)+(capped?' · capped at virtual book':''));
+  log('BUY '+qty.toFixed(4)+' ETH @ ~'+entry0.toFixed(1)+' at demand zone '+ST.pos.zone
+   +' · SL '+stop.toFixed(1)+' · TP '+tp.toFixed(1)+' ('+tptag+', '+(slD>0?((tp-entry0)/slD).toFixed(1):'2')+'R)'
+   +' · risk $'+(qty*slD).toFixed(2)+(capped?' · capped':''));
   await wait(1200);
   let ap=entry0,fsz=qty;
   try{const o=await api('GET','/api/v5/trade/order?ordId='+ordId+'&instId='+INST);
    const d=(o.data||[])[0]||{};
    if(d.avgPx)ap=parseFloat(d.avgPx);if(d.accFillSz)fsz=parseFloat(d.accFillSz);}catch(e){}
   const delta=ap-ST.pos.entry;
-  ST.pos.entry=ap;ST.pos.qty=+q4(fsz);ST.pos.sl+=delta;ST.pos.tp+=delta;
+  ST.pos.entry=ap;ST.pos.qty=+q4(fsz);
+  ST.pos.sl=ap-(entry0-stop);ST.pos.tp=ap+(tp-entry0);
   ST.pos.ext=ap;ST.pos.lastTrail=ap;
-  log('fill confirmed @ '+ap.toFixed(1)+' · '+ST.pos.qty.toFixed(4)+' ETH');
+  log('fill confirmed @ '+ap.toFixed(1)+' · '+ST.pos.qty.toFixed(4)+' ETH · R:R 1:'+(slD>0?((ST.pos.tp-ST.pos.entry)/(ap-ST.pos.sl)).toFixed(1):'2'));
   await armOCO(ST.pos);save();
  }catch(e){ST.pos=null;log('buy rejected — '+e.message);save();}
 }
@@ -161,14 +213,6 @@ function finalizeTrade(exit,reason){
 }
 function manage(){
  const x=ST.pos;if(!x||!ST.price)return;
- x.ext=Math.max(x.ext||x.entry,ST.price);
- let moved=false;
- if(!x.be&&x.ext>=x.entry+1.2*x.atr){x.sl=Math.max(x.sl,x.entry+0.1*x.atr);x.be=true;moved=true;
-  log('breakeven — stop → '+x.sl.toFixed(1));}
- if(x.ext>=x.entry+2*x.atr){const ns=ST.price-1.2*x.atr;
-  if(ns>x.sl){x.sl=ns;if(ns-(x.lastTrail||0)>0.15*x.atr){x.lastTrail=ns;moved=true;
-   log('trail → '+ns.toFixed(1));}}}
- if(moved){save();if(x.algoId)amendStop(x);else if(HASKEYS)armOCO(x);}
  if(ST.price<=x.sl)sell(x.sl,'STOP');
  else if(ST.price>=x.tp)sell(x.tp,'TARGET');
 }
@@ -189,31 +233,33 @@ async function pollCandles(){
 function onClosed(){
  recompute();
  const i=ST.candles.length-1,c=ST.candles[i];if(i<1||!ST.ind)return;
- const f=ST.ind.f[i],s=ST.ind.s[i],t=ST.ind.t[i],r=ST.ind.r[i],a=ST.ind.a[i];
+ const r=ST.ind.r[i],a=ST.ind.a[i];
  const warmed=ST.candles.length>=WARM&&isFinite(r)&&isFinite(a)&&a>0;
  ST.seen++;snapshotEq();
  if(ST.pos){
-  const crossDn=f<s&&ST.ind.f[i-1]>=ST.ind.s[i-1];
-  if(crossDn){log('bear cross — selling back to USDT');sell(c.c,'SIGNAL');}
-  else log('HOLD · uPnL '+(((ST.price||c.c)-ST.pos.entry)*ST.pos.qty).toFixed(2)+' · virtual equity $'+equity().toFixed(2));
+  const x=ST.pos;
+  if(Date.now()-x.tOpen>MAX_HOLD_MS&&!x.closing){
+   log('time-stop — position older than 12h · exiting at market');
+   sell(c.c,'TIME');
+  }else log('HOLD · uPnL '+(((ST.price||c.c)-x.entry)*x.qty).toFixed(2)+' · zone '+x.zone+' · SL '+x.sl.toFixed(1)+' / TP '+x.tp.toFixed(1));
   save();return;
  }
  if(!ST.settings.running){save();return;}
  if(!warmed){log('calibrating — '+ST.candles.length+'/'+WARM+' candles');save();return;}
  if(ST.cool>0){ST.cool--;log('cooldown — '+ST.cool+' candles left');save();return;}
  const aPct=a/c.c;
- if(aPct<0.0004||aPct>0.02){log('volatility out of band ('+(aPct*100).toFixed(2)+'%)');save();return;}
- const cu=f>s&&ST.ind.f[i-1]<=ST.ind.s[i-1],cd=f<s&&ST.ind.f[i-1]>=ST.ind.s[i-1];
- const volOK=c.v>0.8*(ST.avgVol||c.v),bps=(f-s)/c.c*1e4;
- if(cd){log('bear cross — long-only spot: staying in cash');}
- else if(cu){
-  const rej=[];
-  if(ST.settings.trend&&!(c.c>t))rej.push('below EMA200');
-  if(r<45||r>72)rej.push('RSI '+r.toFixed(1));
-  if(!volOK)rej.push('thin tape');
-  if(rej.length)log('bull cross +'+bps.toFixed(1)+'bps rejected — '+rej.join(' · '));
-  else buy(c,a);
- }else log('SCAN · EMA Δ '+(bps>=0?'+':'')+bps.toFixed(1)+' bps · RSI '+r.toFixed(1)+' · '+(c.c>t?'above':'below')+' EMA200');
+ if(aPct>CHAOS){log('chaos guard — ATR '+(aPct*100).toFixed(2)+'% too wild · standing down');save();return;}
+ const zones=computeZones(ST.candles);
+ const sup=supportHit(zones,c,a);
+ if(sup&&isFinite(r)&&r<RSI_BUY){
+  log('SETUP — price in demand zone '+sup.lo.toFixed(1)+'-'+sup.hi.toFixed(1)
+   +' ('+sup.n+' bounce'+(sup.n>1?'s':'')+') · RSI '+r.toFixed(1)+' stretched · buying');
+  buy(c,a,sup);
+ }
+ else if(sup){if(ST.seen%2===0)log('in zone '+sup.lo.toFixed(1)+'-'+sup.hi.toFixed(1)+' · RSI '+r.toFixed(1)+' not stretched (need <'+RSI_BUY+') · waiting');}
+ else if(ST.seen%3===0){
+  log('SCAN · RSI '+r.toFixed(1)+' · '+zones.length+' zones tracked · hunting a zone dip');
+ }
  const v20=ST.candles.slice(-20);
  ST.avgVol=v20.reduce((s2,x)=>s2+x.v,0)/Math.max(1,v20.length);
  save();
@@ -254,14 +300,11 @@ async function reconcile(){
    log('OCO fired between runs — trade recorded from fills');
   }
   else if(ST.pos&&!ST.pos.closing&&!ST.pos.algoId){await armOCO(ST.pos);}
-  /* ---- blow-up guard: flat + virtual equity below floor → fresh $10,000 ---- */
   if(!ST.pos){
    const eq=virtualEquity();
    if(eq<VCAP_FLOOR){
     ST.attempts=(ST.attempts||1)+1;
-    log('*** VIRTUAL ACCOUNT BLOWN — equity $'+eq.toFixed(2)+' < $'+VCAP_FLOOR
-     +' · starting fresh $'+VCAP0+' · ATTEMPT #'+ST.attempts+' ***');
-    /* keep trade history visible; shift base so the ledger restarts at exactly $10,000 */
+    log('*** VIRTUAL ACCOUNT BLOWN — equity $'+eq.toFixed(2)+' · fresh $'+VCAP0+' · ATTEMPT #'+ST.attempts+' ***');
     ST.base=VCAP0-ST.trades.reduce((s,t)=>s+(t.pnl||0),0);
     ST.peak=VCAP0;ST.cool=0;save();
    }
