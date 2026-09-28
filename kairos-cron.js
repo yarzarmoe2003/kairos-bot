@@ -224,11 +224,27 @@ async function pollCandles(){
  ST.candles=closed.slice(-MAXC);recompute();
  if(!ST.price)ST.price=closed[closed.length-1].c;
  const newest=closed[closed.length-1];
- if(newest.t>ST.lastClosedT){
-  const first=ST.lastClosedT>0;ST.lastClosedT=newest.t;
-  if(first)onClosed();
-  else log('history synced — '+ST.candles.length+' × '+BAR+' candles');
- }
+    if(!ST.lastClosedT){
+      ST.lastClosedT=newest.t;
+      log('history synced — '+ST.candles.length+' × '+BAR+' candles');
+    }else if(newest.t>ST.lastClosedT){
+      let fired=0;
+      for(const cc of ST.candles){
+        if(cc.t>ST.lastClosedT){ onClosedAt(cc); fired++; }
+      }
+      if(!fired){
+        ST.lastClosedT=newest.t;
+        onClosed();
+        fired=1;
+      }
+      log('processed '+fired+' closed candle'+(fired>1?'s':''));
+    }else{
+      /* no new candle yet — but run diagnostics so RSI/zones stay live */
+      recompute();
+      ST.seen++;
+      snapshotEq();
+      save();
+    }
 }
 function onClosed(){
  recompute();
