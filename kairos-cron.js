@@ -245,10 +245,12 @@ async function pollCandles(){
       snapshotEq();
       save();
     }
+}function onClosed(){
+  onClosedAt(ST.candles[ST.candles.length-1]);
 }
-function onClosed(){
- recompute();
- const i=ST.candles.length-1,c=ST.candles[i];if(i<1||!ST.ind)return;
+function onClosedAt(c){
+  recompute();
+  const i=ST.candles.indexOf(c);if(i<1||!ST.ind||!c)return;
  const r=ST.ind.r[i],a=ST.ind.a[i];
  const warmed=ST.candles.length>=WARM&&isFinite(r)&&isFinite(a)&&a>0;
  ST.seen++;snapshotEq();
